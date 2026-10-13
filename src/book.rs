@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::pool::{NULL, NodePool};
-use crate::types::{Order, OrderId, Price, Qty, Side};
+use crate::types::{Fill, Order, OrderId, Price, Qty, Side};
 
 /// Ticks live in `[0, MAX_TICKS)`. 2^20 levels at 24 bytes each is 24 MiB per
 /// side, allocated once; the OS only faults pages in as levels get touched.
@@ -68,7 +68,7 @@ impl OrderBook {
         }
     }
 
-    /// Rest an order on the book. No matching yet; that lands tomorrow.
+    /// Rest an order on the book. No matching; use `submit` for that.
     pub fn insert(
         &mut self,
         id: OrderId,
@@ -87,20 +87,26 @@ impl OrderBook {
         }
 
         self.seq += 1;
-        let order = Order {
+        self.insert_order(Order {
             id,
             side,
             price,
             qty,
             seq: self.seq,
-        };
+        });
+        Ok(())
+    }
+
+    /// Link a validated order into its level. Shared by `insert` and the
+    /// resting remainder in `submit`.
+    fn insert_order(&mut self, order: Order) {
         let node_idx = self.pool.alloc(&order);
 
-        let levels = match side {
+        let levels = match order.side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        let level = &mut levels[price as usize];
+        let level = &mut levels[order.price as usize];
         if level.tail == NULL {
             level.head = node_idx;
         } else {
@@ -108,16 +114,136 @@ impl OrderBook {
         }
         self.pool.get_mut(node_idx).prev = level.tail;
         level.tail = node_idx;
-        level.total_qty += qty;
+        level.total_qty += order.qty;
         level.order_count += 1;
 
-        self.id_to_node.insert(id, node_idx);
+        self.id_to_node.insert(order.id, node_idx);
 
-        match side {
-            Side::Bid => self.best_bid = Some(self.best_bid.map_or(price, |b| b.max(price))),
-            Side::Ask => self.best_ask = Some(self.best_ask.map_or(price, |a| a.min(price))),
+        match order.side {
+            Side::Bid => {
+                self.best_bid = Some(self.best_bid.map_or(order.price, |b| b.max(order.price)))
+            }
+            Side::Ask => {
+                self.best_ask = Some(self.best_ask.map_or(order.price, |a| a.min(order.price)))
+            }
         }
-        Ok(())
+    }
+
+    /// Submit an order that may cross the spread.
+    ///
+    /// A buy crosses when its price reaches the best ask; a sell crosses
+    /// when its price reaches the best bid. Levels are walked best-first and
+    /// resting orders are consumed head-first, which is FIFO time priority.
+    /// Every trade executes at the resting order's price.
+    ///
+    /// Fills are written into `fills` in execution order and the fill count
+    /// is returned. Nothing is allocated on this path. If the buffer runs
+    /// out, matching stops early. Any unfilled remainder rests on the book
+    /// at the limit price, like a plain limit order.
+    pub fn submit(
+        &mut self,
+        id: OrderId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        fills: &mut [Fill],
+    ) -> Result<usize, BookError> {
+        if price >= MAX_TICKS as u64 {
+            return Err(BookError::PriceOutOfRange);
+        }
+        if qty == 0 {
+            return Err(BookError::ZeroQuantity);
+        }
+        if self.id_to_node.contains_key(&id) {
+            return Err(BookError::DuplicateOrder);
+        }
+
+        self.seq += 1;
+        let taker_seq = self.seq;
+
+        let mut remaining = qty;
+        let mut n_fills = 0;
+
+        while remaining > 0 && n_fills < fills.len() {
+            let touch = match side {
+                Side::Bid => self.best_ask,
+                Side::Ask => self.best_bid,
+            };
+            let touch_price = match touch {
+                Some(p) => match side {
+                    Side::Bid => price >= p,
+                    Side::Ask => price <= p,
+                }
+                .then_some(p),
+                None => None,
+            };
+            let Some(touch_price) = touch_price else {
+                break;
+            };
+
+            // Consume the level head-first: queue order is time priority.
+            {
+                let (levels, pool) = match side {
+                    Side::Bid => (&mut self.asks, &mut self.pool),
+                    Side::Ask => (&mut self.bids, &mut self.pool),
+                };
+                let level = &mut levels[touch_price as usize];
+                while remaining > 0 && n_fills < fills.len() {
+                    let head = level.head;
+                    if head == NULL {
+                        break;
+                    }
+                    let maker = *pool.get(head);
+                    let fill_qty = remaining.min(maker.qty);
+                    fills[n_fills] = Fill {
+                        taker_id: id,
+                        maker_id: maker.id,
+                        price: touch_price,
+                        qty: fill_qty,
+                    };
+                    n_fills += 1;
+                    remaining -= fill_qty;
+                    level.total_qty -= fill_qty;
+                    if maker.qty == fill_qty {
+                        let next = maker.next;
+                        level.head = next;
+                        if next == NULL {
+                            level.tail = NULL;
+                        } else {
+                            pool.get_mut(next).prev = NULL;
+                        }
+                        level.order_count -= 1;
+                        self.id_to_node.remove(&maker.id);
+                        pool.free(head);
+                    } else {
+                        pool.get_mut(head).qty -= fill_qty;
+                    }
+                }
+            }
+
+            let emptied = match side {
+                Side::Bid => self.asks[touch_price as usize].is_empty(),
+                Side::Ask => self.bids[touch_price as usize].is_empty(),
+            };
+            if emptied {
+                match side {
+                    Side::Bid => self.best_ask = self.scan_up(touch_price),
+                    Side::Ask => self.best_bid = self.scan_down(touch_price),
+                }
+            }
+        }
+
+        if remaining > 0 {
+            self.insert_order(Order {
+                id,
+                side,
+                price,
+                qty: remaining,
+                seq: taker_seq,
+            });
+        }
+
+        Ok(n_fills)
     }
 
     /// Pull an order off the book. O(1) unlink; only scans for a new best

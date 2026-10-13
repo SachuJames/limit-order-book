@@ -30,3 +30,18 @@ pub struct Order {
     pub qty: Qty,
     pub seq: u64,
 }
+
+/// One executed trade between an aggressive order and a resting order.
+///
+/// Fills are written into a caller-provided buffer so the matching path
+/// never allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fill {
+    /// The aggressive order that crossed the spread.
+    pub taker_id: OrderId,
+    /// The resting order that got hit.
+    pub maker_id: OrderId,
+    /// Execution price. Always the resting order's price, never the taker's.
+    pub price: Price,
+    pub qty: Qty,
+}
