@@ -5,11 +5,13 @@ priority, array-indexed price levels, pooled order nodes, and no allocations
 on the hot path. The design borrows from the OpenBook v2 slab layout, adapted
 into a standalone zero-alloc core.
 
-Day 1 of a 5-day build. The book structure is in place; matching lands next.
+Day 2 of a 5-day build. The matching engine is in: aggressive orders cross the
+spread, walk price levels best-first, and fill resting orders FIFO at the
+resting price. Unfilled remainders rest at the limit price.
 
 ## Layout
 
-- `src/types.rs` — `Side`, `Order`, and the tick/quantity/id aliases.
+- `src/types.rs` — `Side`, `Order`, `Fill`, and the tick/quantity/id aliases.
 - `src/pool.rs` — intrusive node slab with a free list. `alloc` pops a slot,
   `free` pushes it back. The slab only grows when the free list runs dry.
 - `src/book.rs` — the book itself: one dense level array per side, indexed
@@ -26,6 +28,13 @@ time priority for free.
   totals and the cached best bid/ask.
 - `cancel` unlinks in O(1). It only scans for a new best price when the
   emptied level was the best one, which keeps the common case flat.
+- `submit` takes an aggressive order plus a caller-provided fill buffer and
+  returns the fill count. A buy crosses when its price reaches the best ask,
+  a sell when its price reaches the best bid. Levels are consumed best-first
+  and head-first (time priority), every trade prints at the resting price,
+  and whatever is left over rests at the limit price. The buffer is the only
+  output channel, so the hot path stays allocation-free. If the buffer runs
+  out, matching stops and the remainder rests.
 - Order ids map to node slots through a hash map for now. A dense id table
   is planned once the matching engine is in.
 
@@ -38,6 +47,5 @@ cargo test
 
 ## Next
 
-- Matching engine: cross the spread, walk levels, fill or rest.
 - Self-trade behavior and order types (limit, IOC, FOK).
 - Criterion benchmarks with flamegraphs, reporting p50/p99/p99.9 per order.
