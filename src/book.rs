@@ -641,4 +641,109 @@ mod tests {
             Err(BookError::DuplicateOrder)
         );
     }
+
+    #[test]
+    fn filled_maker_cannot_be_cancelled() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10).unwrap();
+        let mut fills = fill_buf();
+        let n = book.submit(2, Side::Bid, 100, 10, &mut fills).unwrap();
+        assert_eq!(n, 1);
+        // The fill removed the maker from the id table as well as the level.
+        assert_eq!(book.cancel(1), Err(BookError::UnknownOrder));
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn cancel_after_partial_fill_returns_remaining_qty() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10).unwrap();
+        let mut fills = fill_buf();
+        let n = book.submit(2, Side::Bid, 100, 4, &mut fills).unwrap();
+        assert_eq!(n, 1);
+        let gone = book.cancel(1).unwrap();
+        assert_eq!(gone.qty, 6);
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn order_id_reusable_once_off_the_book() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 5).unwrap();
+        let mut fills = fill_buf();
+        book.submit(2, Side::Bid, 100, 5, &mut fills).unwrap();
+        // Id 1 fully filled: free to use again.
+        book.insert(1, Side::Ask, 101, 5).unwrap();
+        book.cancel(1).unwrap();
+        // And free again after a cancel.
+        book.insert(1, Side::Bid, 99, 5).unwrap();
+        assert_eq!(book.len(), 1);
+        assert_eq!(book.best_bid(), Some(99));
+    }
+
+    #[test]
+    fn full_fill_buffer_stops_matching_and_rests_remainder() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 5).unwrap();
+        book.insert(2, Side::Ask, 100, 5).unwrap();
+        let mut fills = [Fill {
+            taker_id: 0,
+            maker_id: 0,
+            price: 0,
+            qty: 0,
+        }; 1];
+        let n = book.submit(3, Side::Bid, 100, 10, &mut fills).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            fills[0],
+            Fill {
+                taker_id: 3,
+                maker_id: 1,
+                price: 100,
+                qty: 5,
+            }
+        );
+        // Matching stopped at the buffer limit: maker 2 is untouched and
+        // the taker's remaining 5 rest as a bid.
+        assert_eq!(book.level_qty(Side::Ask, 100), 5);
+        assert_eq!(book.level_qty(Side::Bid, 100), 5);
+        assert_eq!(book.len(), 2);
+    }
+
+    #[test]
+    fn empty_fill_buffer_rests_without_matching() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10).unwrap();
+        let n = book.submit(2, Side::Bid, 100, 5, &mut []).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(book.level_qty(Side::Ask, 100), 10);
+        assert_eq!(book.level_qty(Side::Bid, 100), 5);
+        assert_eq!(book.len(), 2);
+    }
+
+    #[test]
+    fn large_order_id_roundtrip() {
+        let mut book = OrderBook::new();
+        book.insert(1_000_000, Side::Bid, 100, 10).unwrap();
+        assert_eq!(book.len(), 1);
+        let gone = book.cancel(1_000_000).unwrap();
+        assert_eq!(gone.id, 1_000_000);
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn order_id_out_of_range_rejected() {
+        let mut book = OrderBook::new();
+        let big = crate::MAX_IDS as OrderId;
+        assert_eq!(
+            book.insert(big, Side::Bid, 100, 10),
+            Err(BookError::OrderIdOutOfRange)
+        );
+        let mut fills = fill_buf();
+        assert_eq!(
+            book.submit(big, Side::Bid, 100, 10, &mut fills),
+            Err(BookError::OrderIdOutOfRange)
+        );
+        assert!(book.is_empty());
+    }
 }
