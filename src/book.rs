@@ -5,8 +5,7 @@
 //! appended at the tail so queue order is time priority. Insert and cancel
 //! never allocate once the pool is warm.
 
-use std::collections::HashMap;
-
+use crate::id_table::IdTable;
 use crate::pool::{NULL, NodePool};
 use crate::types::{Fill, Order, OrderId, Price, Qty, Side};
 
@@ -43,13 +42,14 @@ pub enum BookError {
     ZeroQuantity,
     DuplicateOrder,
     UnknownOrder,
+    OrderIdOutOfRange,
 }
 
 pub struct OrderBook {
     bids: Box<[Level]>,
     asks: Box<[Level]>,
     pool: NodePool,
-    id_to_node: HashMap<OrderId, u32>,
+    ids: IdTable,
     seq: u64,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
@@ -61,7 +61,7 @@ impl OrderBook {
             bids: vec![Level::empty(); MAX_TICKS].into_boxed_slice(),
             asks: vec![Level::empty(); MAX_TICKS].into_boxed_slice(),
             pool: NodePool::with_capacity(4096),
-            id_to_node: HashMap::new(),
+            ids: IdTable::new(),
             seq: 0,
             best_bid: None,
             best_ask: None,
@@ -82,7 +82,10 @@ impl OrderBook {
         if qty == 0 {
             return Err(BookError::ZeroQuantity);
         }
-        if self.id_to_node.contains_key(&id) {
+        if !IdTable::in_range(id) {
+            return Err(BookError::OrderIdOutOfRange);
+        }
+        if self.ids.contains(id) {
             return Err(BookError::DuplicateOrder);
         }
 
@@ -117,7 +120,7 @@ impl OrderBook {
         level.total_qty += order.qty;
         level.order_count += 1;
 
-        self.id_to_node.insert(order.id, node_idx);
+        self.ids.insert(order.id, node_idx);
 
         match order.side {
             Side::Bid => {
@@ -154,7 +157,10 @@ impl OrderBook {
         if qty == 0 {
             return Err(BookError::ZeroQuantity);
         }
-        if self.id_to_node.contains_key(&id) {
+        if !IdTable::in_range(id) {
+            return Err(BookError::OrderIdOutOfRange);
+        }
+        if self.ids.contains(id) {
             return Err(BookError::DuplicateOrder);
         }
 
@@ -213,7 +219,7 @@ impl OrderBook {
                             pool.get_mut(next).prev = NULL;
                         }
                         level.order_count -= 1;
-                        self.id_to_node.remove(&maker.id);
+                        self.ids.remove(maker.id);
                         pool.free(head);
                     } else {
                         pool.get_mut(head).qty -= fill_qty;
@@ -249,7 +255,7 @@ impl OrderBook {
     /// Pull an order off the book. O(1) unlink; only scans for a new best
     /// when the emptied level was the best one.
     pub fn cancel(&mut self, id: OrderId) -> Result<Order, BookError> {
-        let node_idx = *self.id_to_node.get(&id).ok_or(BookError::UnknownOrder)?;
+        let node_idx = self.ids.get(id).ok_or(BookError::UnknownOrder)?;
         let node = *self.pool.get(node_idx);
 
         let (levels, pool) = match node.side {
@@ -271,7 +277,7 @@ impl OrderBook {
         level.total_qty -= node.qty;
         level.order_count -= 1;
 
-        self.id_to_node.remove(&id);
+        self.ids.remove(id);
         self.pool.free(node_idx);
 
         if level.is_empty() {
@@ -364,11 +370,11 @@ impl OrderBook {
 
     /// Resting order count across both sides.
     pub fn len(&self) -> usize {
-        self.id_to_node.len()
+        self.ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.id_to_node.is_empty()
+        self.ids.is_empty()
     }
 
     /// Pool slots in use right now. Test hook.
