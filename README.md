@@ -16,6 +16,8 @@ resting price. Unfilled remainders rest at the limit price.
   `free` pushes it back. The slab only grows when the free list runs dry.
 - `src/book.rs` — the book itself: one dense level array per side, indexed
   directly by price tick.
+- `src/id_table.rs` — dense order-id index: id to pool slot in one array
+  lookup, grown geometrically as larger ids arrive.
 
 ## How it works
 
@@ -35,8 +37,13 @@ time priority for free.
   and whatever is left over rests at the limit price. The buffer is the only
   output channel, so the hot path stays allocation-free. If the buffer runs
   out, matching stops and the remainder rests.
-- Order ids map to node slots through a hash map for now. A dense id table
-  is planned once the matching engine is in.
+- Order ids map to node slots through the dense id table in
+  `src/id_table.rs`: one array lookup, no hashing on the cancel or
+  duplicate-check path. The table doubles as larger ids arrive, so memory
+  tracks the largest live id rather than the order count. Ids are u64 on
+  the wire but the index caps at 2^24; `insert` and `submit` reject ids
+  past that with `OrderIdOutOfRange` instead of forcing a giant
+  allocation.
 
 ## Build and test
 
