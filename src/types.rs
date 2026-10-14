@@ -20,6 +20,21 @@ pub type Qty = u64;
 /// Client-assigned order id. Unique per order for the life of the book.
 pub type OrderId = u64;
 
+/// Identifies the trader (or session) behind an order. Only used for
+/// self-trade prevention; the book never matches on it otherwise.
+pub type TraderId = u32;
+
+/// How a submitted order behaves once it hits the book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderType {
+    /// Fill whatever crosses, rest the remainder at the limit price.
+    Limit,
+    /// Fill whatever crosses, discard the remainder. Never rests.
+    Ioc,
+    /// Fill everything or nothing. Never rests, never partial.
+    Fok,
+}
+
 /// An order as the book sees it. `seq` is assigned at insert time and decides
 /// time priority inside a price level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +44,7 @@ pub struct Order {
     pub price: Price,
     pub qty: Qty,
     pub seq: u64,
+    pub trader: TraderId,
 }
 
 /// One executed trade between an aggressive order and a resting order.

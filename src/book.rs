@@ -7,7 +7,7 @@
 
 use crate::id_table::IdTable;
 use crate::pool::{NULL, NodePool};
-use crate::types::{Fill, Order, OrderId, Price, Qty, Side};
+use crate::types::{Fill, Order, OrderId, OrderType, Price, Qty, Side, TraderId};
 
 /// Ticks live in `[0, MAX_TICKS)`. 2^20 levels at 24 bytes each is 24 MiB per
 /// side, allocated once; the OS only faults pages in as levels get touched.
@@ -75,6 +75,7 @@ impl OrderBook {
         side: Side,
         price: Price,
         qty: Qty,
+        trader: TraderId,
     ) -> Result<(), BookError> {
         if price >= MAX_TICKS as u64 {
             return Err(BookError::PriceOutOfRange);
@@ -96,6 +97,7 @@ impl OrderBook {
             price,
             qty,
             seq: self.seq,
+            trader,
         });
         Ok(())
     }
@@ -141,14 +143,23 @@ impl OrderBook {
     ///
     /// Fills are written into `fills` in execution order and the fill count
     /// is returned. Nothing is allocated on this path. If the buffer runs
-    /// out, matching stops early. Any unfilled remainder rests on the book
-    /// at the limit price, like a plain limit order.
+    /// out, matching stops early.
+    ///
+    /// `kind` decides what happens to an unfilled remainder: `Limit` rests
+    /// it at the limit price, `Ioc` drops it, and `Fok` never matches at
+    /// all unless the whole quantity is available up front.
+    ///
+    /// Self-trade rule: if the aggressive order would cross a resting order
+    /// from the same trader, the resting order is cancelled instead and no
+    /// fill is printed. A trader can never buy from or sell to themselves.
     pub fn submit(
         &mut self,
         id: OrderId,
         side: Side,
         price: Price,
         qty: Qty,
+        trader: TraderId,
+        kind: OrderType,
         fills: &mut [Fill],
     ) -> Result<usize, BookError> {
         if price >= MAX_TICKS as u64 {
@@ -162,6 +173,10 @@ impl OrderBook {
         }
         if self.ids.contains(id) {
             return Err(BookError::DuplicateOrder);
+        }
+
+        if kind == OrderType::Fok && self.fillable_qty(side, price, trader) < qty {
+            return Ok(0);
         }
 
         self.seq += 1;
@@ -200,6 +215,22 @@ impl OrderBook {
                         break;
                     }
                     let maker = *pool.get(head);
+                    if maker.trader == trader {
+                        // Self-trade: cancel the resting order, print no
+                        // fill, and keep walking the level.
+                        let next = maker.next;
+                        level.head = next;
+                        if next == NULL {
+                            level.tail = NULL;
+                        } else {
+                            pool.get_mut(next).prev = NULL;
+                        }
+                        level.total_qty -= maker.qty;
+                        level.order_count -= 1;
+                        self.ids.remove(maker.id);
+                        pool.free(head);
+                        continue;
+                    }
                     let fill_qty = remaining.min(maker.qty);
                     fills[n_fills] = Fill {
                         taker_id: id,
@@ -239,17 +270,55 @@ impl OrderBook {
             }
         }
 
-        if remaining > 0 {
+        if remaining > 0 && kind == OrderType::Limit {
             self.insert_order(Order {
                 id,
                 side,
                 price,
                 qty: remaining,
                 seq: taker_seq,
+                trader,
             });
         }
 
         Ok(n_fills)
+    }
+
+    /// How much resting quantity could actually fill an aggressive order at
+    /// this price: crossable levels, best first, skipping the trader's own
+    /// orders (those get cancelled, not filled). Used for the FOK check.
+    fn fillable_qty(&self, side: Side, price: Price, trader: TraderId) -> Qty {
+        let mut total = 0u64;
+        let mut touch = match side {
+            Side::Bid => self.best_ask,
+            Side::Ask => self.best_bid,
+        };
+        while let Some(touch_price) = touch {
+            let crosses = match side {
+                Side::Bid => price >= touch_price,
+                Side::Ask => price <= touch_price,
+            };
+            if !crosses {
+                break;
+            }
+            let levels = match side {
+                Side::Bid => &self.asks,
+                Side::Ask => &self.bids,
+            };
+            let mut cur = levels[touch_price as usize].head;
+            while cur != NULL {
+                let node = self.pool.get(cur);
+                if node.trader != trader {
+                    total = total.saturating_add(node.qty);
+                }
+                cur = node.next;
+            }
+            touch = match side {
+                Side::Bid => self.scan_up(touch_price),
+                Side::Ask => self.scan_down(touch_price),
+            };
+        }
+        total
     }
 
     /// Pull an order off the book. O(1) unlink; only scans for a new best
@@ -298,6 +367,7 @@ impl OrderBook {
             price: node.price,
             qty: node.qty,
             seq: node.seq,
+            trader: node.trader,
         })
     }
 
@@ -362,6 +432,7 @@ impl OrderBook {
                 price: n.price,
                 qty: n.qty,
                 seq: n.seq,
+                trader: n.trader,
             });
             cur = n.next;
         }
@@ -397,10 +468,10 @@ mod tests {
     #[test]
     fn best_bid_ask_track_inserts() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Bid, 100, 10).unwrap();
-        book.insert(2, Side::Bid, 101, 5).unwrap();
-        book.insert(3, Side::Ask, 102, 7).unwrap();
-        book.insert(4, Side::Ask, 103, 3).unwrap();
+        book.insert(1, Side::Bid, 100, 10, 1).unwrap();
+        book.insert(2, Side::Bid, 101, 5, 1).unwrap();
+        book.insert(3, Side::Ask, 102, 7, 1).unwrap();
+        book.insert(4, Side::Ask, 103, 3, 1).unwrap();
         assert_eq!(book.best_bid(), Some(101));
         assert_eq!(book.best_ask(), Some(102));
         assert_eq!(book.len(), 4);
@@ -409,9 +480,9 @@ mod tests {
     #[test]
     fn time_priority_inside_a_level() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Bid, 100, 10).unwrap();
-        book.insert(2, Side::Bid, 100, 20).unwrap();
-        book.insert(3, Side::Bid, 100, 30).unwrap();
+        book.insert(1, Side::Bid, 100, 10, 1).unwrap();
+        book.insert(2, Side::Bid, 100, 20, 1).unwrap();
+        book.insert(3, Side::Bid, 100, 30, 1).unwrap();
         let ids: Vec<OrderId> = book
             .level_orders(Side::Bid, 100)
             .iter()
@@ -424,9 +495,9 @@ mod tests {
     #[test]
     fn cancel_middle_keeps_queue_order() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 50, 10).unwrap();
-        book.insert(2, Side::Ask, 50, 20).unwrap();
-        book.insert(3, Side::Ask, 50, 30).unwrap();
+        book.insert(1, Side::Ask, 50, 10, 1).unwrap();
+        book.insert(2, Side::Ask, 50, 20, 1).unwrap();
+        book.insert(3, Side::Ask, 50, 30, 1).unwrap();
         let gone = book.cancel(2).unwrap();
         assert_eq!(gone.qty, 20);
         let ids: Vec<OrderId> = book
@@ -441,8 +512,8 @@ mod tests {
     #[test]
     fn cancel_empty_best_moves_best() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Bid, 100, 10).unwrap();
-        book.insert(2, Side::Bid, 99, 10).unwrap();
+        book.insert(1, Side::Bid, 100, 10, 1).unwrap();
+        book.insert(2, Side::Bid, 99, 10, 1).unwrap();
         book.cancel(1).unwrap();
         assert_eq!(book.best_bid(), Some(99));
         book.cancel(2).unwrap();
@@ -454,16 +525,16 @@ mod tests {
     fn rejects_bad_input() {
         let mut book = OrderBook::new();
         assert_eq!(
-            book.insert(1, Side::Bid, MAX_TICKS as u64, 10),
+            book.insert(1, Side::Bid, MAX_TICKS as u64, 10, 1),
             Err(BookError::PriceOutOfRange)
         );
         assert_eq!(
-            book.insert(1, Side::Bid, 100, 0),
+            book.insert(1, Side::Bid, 100, 0, 1),
             Err(BookError::ZeroQuantity)
         );
-        book.insert(1, Side::Bid, 100, 10).unwrap();
+        book.insert(1, Side::Bid, 100, 10, 1).unwrap();
         assert_eq!(
-            book.insert(1, Side::Bid, 100, 10),
+            book.insert(1, Side::Bid, 100, 10, 1),
             Err(BookError::DuplicateOrder)
         );
         assert_eq!(book.cancel(999), Err(BookError::UnknownOrder));
@@ -473,7 +544,7 @@ mod tests {
     fn pool_slots_get_reused() {
         let mut book = OrderBook::new();
         for i in 0..100 {
-            book.insert(i, Side::Bid, 100 + (i % 10), 1).unwrap();
+            book.insert(i, Side::Bid, 100 + (i % 10), 1, 1).unwrap();
         }
         assert_eq!(book.pool_used(), 100);
         for i in 0..100 {
@@ -481,7 +552,7 @@ mod tests {
         }
         assert_eq!(book.pool_used(), 0);
         for i in 100..200 {
-            book.insert(i, Side::Bid, 100 + (i % 10), 1).unwrap();
+            book.insert(i, Side::Bid, 100 + (i % 10), 1, 1).unwrap();
         }
         // No growth: the freed slots were reused.
         assert_eq!(book.pool_used(), 100);
@@ -500,9 +571,11 @@ mod tests {
     #[test]
     fn cross_full_fill_clears_book() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 100, 10, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 100, 10, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             fills[0],
@@ -521,9 +594,11 @@ mod tests {
     #[test]
     fn partial_fill_rests_remainder() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 100, 25, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 100, 25, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(fills[0].qty, 10);
         assert_eq!(book.len(), 1);
@@ -536,11 +611,13 @@ mod tests {
     #[test]
     fn sweep_walks_multiple_levels_best_first() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
-        book.insert(2, Side::Ask, 101, 10).unwrap();
-        book.insert(3, Side::Ask, 102, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        book.insert(2, Side::Ask, 101, 10, 1).unwrap();
+        book.insert(3, Side::Ask, 102, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(4, Side::Bid, 102, 25, &mut fills).unwrap();
+        let n = book
+            .submit(4, Side::Bid, 102, 25, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 3);
         assert_eq!((fills[0].price, fills[0].qty), (100, 10));
         assert_eq!((fills[1].price, fills[1].qty), (101, 10));
@@ -553,10 +630,12 @@ mod tests {
     #[test]
     fn better_price_matched_first() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 102, 10).unwrap();
-        book.insert(2, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 102, 10, 1).unwrap();
+        book.insert(2, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(3, Side::Bid, 105, 10, &mut fills).unwrap();
+        let n = book
+            .submit(3, Side::Bid, 105, 10, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(fills[0].maker_id, 2);
         assert_eq!(fills[0].price, 100);
@@ -565,11 +644,13 @@ mod tests {
     #[test]
     fn fifo_within_a_level() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 5).unwrap();
-        book.insert(2, Side::Ask, 100, 5).unwrap();
-        book.insert(3, Side::Ask, 100, 5).unwrap();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
+        book.insert(2, Side::Ask, 100, 5, 1).unwrap();
+        book.insert(3, Side::Ask, 100, 5, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(4, Side::Bid, 100, 7, &mut fills).unwrap();
+        let n = book
+            .submit(4, Side::Bid, 100, 7, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(fills[0].maker_id, 1);
         assert_eq!(fills[0].qty, 5);
@@ -588,9 +669,11 @@ mod tests {
     #[test]
     fn executes_at_resting_price_not_taker_price() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 5).unwrap();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 105, 5, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 105, 5, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(fills[0].price, 100);
         assert!(book.is_empty());
@@ -599,9 +682,11 @@ mod tests {
     #[test]
     fn non_crossing_order_just_rests() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 99, 5, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 99, 5, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 0);
         assert_eq!(book.best_bid(), Some(99));
         assert_eq!(book.best_ask(), Some(100));
@@ -611,10 +696,12 @@ mod tests {
     #[test]
     fn sell_taker_sweeps_bids() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Bid, 100, 10).unwrap();
-        book.insert(2, Side::Bid, 99, 10).unwrap();
+        book.insert(1, Side::Bid, 100, 10, 1).unwrap();
+        book.insert(2, Side::Bid, 99, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(3, Side::Ask, 99, 15, &mut fills).unwrap();
+        let n = book
+            .submit(3, Side::Ask, 99, 15, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!((fills[0].price, fills[0].qty), (100, 10));
         assert_eq!((fills[1].price, fills[1].qty), (99, 5));
@@ -628,16 +715,24 @@ mod tests {
         let mut book = OrderBook::new();
         let mut fills = fill_buf();
         assert_eq!(
-            book.submit(1, Side::Bid, MAX_TICKS as u64, 10, &mut fills),
+            book.submit(
+                1,
+                Side::Bid,
+                MAX_TICKS as u64,
+                10,
+                0,
+                OrderType::Limit,
+                &mut fills
+            ),
             Err(BookError::PriceOutOfRange)
         );
         assert_eq!(
-            book.submit(1, Side::Bid, 100, 0, &mut fills),
+            book.submit(1, Side::Bid, 100, 0, 2, OrderType::Limit, &mut fills),
             Err(BookError::ZeroQuantity)
         );
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         assert_eq!(
-            book.submit(1, Side::Bid, 100, 10, &mut fills),
+            book.submit(1, Side::Bid, 100, 10, 2, OrderType::Limit, &mut fills),
             Err(BookError::DuplicateOrder)
         );
     }
@@ -645,9 +740,11 @@ mod tests {
     #[test]
     fn filled_maker_cannot_be_cancelled() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 100, 10, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 100, 10, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         // The fill removed the maker from the id table as well as the level.
         assert_eq!(book.cancel(1), Err(BookError::UnknownOrder));
@@ -657,9 +754,11 @@ mod tests {
     #[test]
     fn cancel_after_partial_fill_returns_remaining_qty() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
         let mut fills = fill_buf();
-        let n = book.submit(2, Side::Bid, 100, 4, &mut fills).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 100, 4, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         let gone = book.cancel(1).unwrap();
         assert_eq!(gone.qty, 6);
@@ -669,14 +768,15 @@ mod tests {
     #[test]
     fn order_id_reusable_once_off_the_book() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 5).unwrap();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
         let mut fills = fill_buf();
-        book.submit(2, Side::Bid, 100, 5, &mut fills).unwrap();
+        book.submit(2, Side::Bid, 100, 5, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         // Id 1 fully filled: free to use again.
-        book.insert(1, Side::Ask, 101, 5).unwrap();
+        book.insert(1, Side::Ask, 101, 5, 1).unwrap();
         book.cancel(1).unwrap();
         // And free again after a cancel.
-        book.insert(1, Side::Bid, 99, 5).unwrap();
+        book.insert(1, Side::Bid, 99, 5, 1).unwrap();
         assert_eq!(book.len(), 1);
         assert_eq!(book.best_bid(), Some(99));
     }
@@ -684,15 +784,17 @@ mod tests {
     #[test]
     fn full_fill_buffer_stops_matching_and_rests_remainder() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 5).unwrap();
-        book.insert(2, Side::Ask, 100, 5).unwrap();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
+        book.insert(2, Side::Ask, 100, 5, 1).unwrap();
         let mut fills = [Fill {
             taker_id: 0,
             maker_id: 0,
             price: 0,
             qty: 0,
         }; 1];
-        let n = book.submit(3, Side::Bid, 100, 10, &mut fills).unwrap();
+        let n = book
+            .submit(3, Side::Bid, 100, 10, 2, OrderType::Limit, &mut fills)
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             fills[0],
@@ -713,8 +815,10 @@ mod tests {
     #[test]
     fn empty_fill_buffer_rests_without_matching() {
         let mut book = OrderBook::new();
-        book.insert(1, Side::Ask, 100, 10).unwrap();
-        let n = book.submit(2, Side::Bid, 100, 5, &mut []).unwrap();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        let n = book
+            .submit(2, Side::Bid, 100, 5, 0, OrderType::Limit, &mut [])
+            .unwrap();
         assert_eq!(n, 0);
         assert_eq!(book.level_qty(Side::Ask, 100), 10);
         assert_eq!(book.level_qty(Side::Bid, 100), 5);
@@ -724,7 +828,7 @@ mod tests {
     #[test]
     fn large_order_id_roundtrip() {
         let mut book = OrderBook::new();
-        book.insert(1_000_000, Side::Bid, 100, 10).unwrap();
+        book.insert(1_000_000, Side::Bid, 100, 10, 1).unwrap();
         assert_eq!(book.len(), 1);
         let gone = book.cancel(1_000_000).unwrap();
         assert_eq!(gone.id, 1_000_000);
@@ -736,14 +840,189 @@ mod tests {
         let mut book = OrderBook::new();
         let big = crate::MAX_IDS as OrderId;
         assert_eq!(
-            book.insert(big, Side::Bid, 100, 10),
+            book.insert(big, Side::Bid, 100, 10, 1),
             Err(BookError::OrderIdOutOfRange)
         );
         let mut fills = fill_buf();
         assert_eq!(
-            book.submit(big, Side::Bid, 100, 10, &mut fills),
+            book.submit(big, Side::Bid, 100, 10, 2, OrderType::Limit, &mut fills),
             Err(BookError::OrderIdOutOfRange)
         );
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn limit_resting_remainder_keeps_trader() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        let mut fills = fill_buf();
+        let n = book
+            .submit(2, Side::Bid, 100, 25, 2, OrderType::Limit, &mut fills)
+            .unwrap();
+        assert_eq!(n, 1);
+        let resting: Vec<Order> = book.level_orders(Side::Bid, 100);
+        assert_eq!(resting.len(), 1);
+        assert_eq!(resting[0].id, 2);
+        assert_eq!(resting[0].qty, 15);
+        assert_eq!(resting[0].trader, 2);
+    }
+
+    #[test]
+    fn ioc_fills_what_it_can_then_vanishes() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        let mut fills = fill_buf();
+        let n = book
+            .submit(2, Side::Bid, 100, 25, 2, OrderType::Ioc, &mut fills)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fills[0].qty, 10);
+        assert!(book.is_empty());
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn ioc_with_nothing_crossing_does_nothing() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        let mut fills = fill_buf();
+        let n = book
+            .submit(2, Side::Bid, 99, 5, 2, OrderType::Ioc, &mut fills)
+            .unwrap();
+        assert_eq!(n, 0);
+        // The ask is untouched and nothing rested.
+        assert_eq!(book.len(), 1);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn fok_full_fill_leaves_no_remainder() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        book.insert(2, Side::Ask, 101, 10, 1).unwrap();
+        let mut fills = fill_buf();
+        let n = book
+            .submit(3, Side::Bid, 101, 20, 2, OrderType::Fok, &mut fills)
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!((fills[0].price, fills[0].qty), (100, 10));
+        assert_eq!((fills[1].price, fills[1].qty), (101, 10));
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn fok_shortfall_kills_the_whole_order() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 1).unwrap();
+        book.insert(2, Side::Ask, 101, 5, 1).unwrap();
+        let mut fills = fill_buf();
+        // Only 15 of the 20 wanted are on the book.
+        let n = book
+            .submit(3, Side::Bid, 101, 20, 2, OrderType::Fok, &mut fills)
+            .unwrap();
+        assert_eq!(n, 0);
+        // Nothing traded, nothing rested, the book is exactly as it was.
+        assert_eq!(book.len(), 2);
+        assert_eq!(book.level_qty(Side::Ask, 100), 10);
+        assert_eq!(book.level_qty(Side::Ask, 101), 5);
+        assert_eq!(book.pool_used(), 2);
+    }
+
+    #[test]
+    fn fok_never_rests_even_when_empty() {
+        let mut book = OrderBook::new();
+        let mut fills = fill_buf();
+        let n = book
+            .submit(1, Side::Bid, 100, 10, 2, OrderType::Fok, &mut fills)
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn self_trade_cancels_resting_order_no_fill() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 10, 7).unwrap();
+        let mut fills = fill_buf();
+        // Same trader buys across their own ask: the ask dies, no fill prints.
+        let n = book
+            .submit(2, Side::Bid, 100, 10, 7, OrderType::Limit, &mut fills)
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(book.cancel(1), Err(BookError::UnknownOrder));
+        // The remainder rested like a normal limit order.
+        assert_eq!(book.level_qty(Side::Bid, 100), 10);
+    }
+
+    #[test]
+    fn self_trade_spares_other_traders_orders() {
+        let mut book = OrderBook::new();
+        // Trader 1's ask is at the head of the level, trader 2's behind it.
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
+        book.insert(2, Side::Ask, 100, 10, 2).unwrap();
+        let mut fills = fill_buf();
+        // Trader 1 buys across: their own ask is cancelled, trader 2's ask
+        // still fills normally at the head of the queue afterwards.
+        let n = book
+            .submit(3, Side::Bid, 100, 10, 1, OrderType::Limit, &mut fills)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            fills[0],
+            Fill {
+                taker_id: 3,
+                maker_id: 2,
+                price: 100,
+                qty: 10,
+            }
+        );
+        assert!(book.is_empty());
+        assert_eq!(book.cancel(1), Err(BookError::UnknownOrder));
+    }
+
+    #[test]
+    fn self_trade_keeps_walking_past_own_orders() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
+        book.insert(2, Side::Ask, 101, 10, 2).unwrap();
+        let mut fills = fill_buf();
+        // Own order at 100 is cancelled and the sweep continues to 101.
+        let n = book
+            .submit(3, Side::Bid, 101, 8, 1, OrderType::Limit, &mut fills)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!((fills[0].maker_id, fills[0].qty), (2, 8));
+        assert_eq!(book.level_qty(Side::Ask, 101), 2);
+        assert_eq!(book.level_qty(Side::Ask, 100), 0);
+        assert_eq!(book.best_ask(), Some(101));
+    }
+
+    #[test]
+    fn self_trade_cancelled_id_can_be_reused() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 5, 1).unwrap();
+        let mut fills = fill_buf();
+        book.submit(2, Side::Bid, 100, 5, 1, OrderType::Limit, &mut fills)
+            .unwrap();
+        // Order 1 was cancelled as a self-trade: its id is free again.
+        // Note the taker's own bid remainder already rests at 100.
+        book.insert(1, Side::Bid, 99, 5, 1).unwrap();
+        assert_eq!(book.len(), 2);
+        assert_eq!(book.best_bid(), Some(100));
+    }
+
+    #[test]
+    fn fok_counts_only_other_traders_qty() {
+        let mut book = OrderBook::new();
+        book.insert(1, Side::Ask, 100, 100, 1).unwrap();
+        let mut fills = fill_buf();
+        // The book shows 100, but it is all trader 1's own size, so a 20-lot
+        // FOK from trader 1 finds nothing fillable and dies.
+        let n = book
+            .submit(2, Side::Bid, 100, 20, 1, OrderType::Fok, &mut fills)
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(book.level_qty(Side::Ask, 100), 100);
     }
 }

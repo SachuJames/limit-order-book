@@ -4,7 +4,7 @@
 //! hot path never touches the allocator. `alloc` pops from a free list,
 //! `free` pushes back. The slab only grows when the free list runs dry.
 
-use crate::types::{Order, Side};
+use crate::types::{Order, Side, TraderId};
 
 /// Null index marker for list links and the free list head.
 pub const NULL: u32 = u32::MAX;
@@ -17,6 +17,7 @@ pub struct Node {
     pub price: u64,
     pub qty: u64,
     pub seq: u64,
+    pub trader: TraderId,
     pub next: u32,
     pub prev: u32,
 }
@@ -29,6 +30,7 @@ impl Node {
             price: 0,
             qty: 0,
             seq: 0,
+            trader: 0,
             next: next_free,
             prev: NULL,
         }
@@ -73,6 +75,7 @@ impl NodePool {
             price: order.price,
             qty: order.qty,
             seq: order.seq,
+            trader: order.trader,
             next: NULL,
             prev: NULL,
         };

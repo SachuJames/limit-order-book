@@ -5,4 +5,4 @@ pub mod types;
 
 pub use book::{BookError, MAX_TICKS, OrderBook};
 pub use id_table::MAX_IDS;
-pub use types::{Fill, Order, OrderId, Price, Qty, Side};
+pub use types::{Fill, Order, OrderId, OrderType, Price, Qty, Side, TraderId};
