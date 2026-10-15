@@ -34,12 +34,12 @@ without them buys nothing. The criterion numbers above stand on their own.
 
 ## Layout
 
-- `src/types.rs` — `Side`, `Order`, `Fill`, and the tick/quantity/id aliases.
-- `src/pool.rs` — intrusive node slab with a free list. `alloc` pops a slot,
+- `src/types.rs`  -- `Side`, `Order`, `Fill`, and the tick/quantity/id aliases.
+- `src/pool.rs`  -- intrusive node slab with a free list. `alloc` pops a slot,
   `free` pushes it back. The slab only grows when the free list runs dry.
-- `src/book.rs` — the book itself: one dense level array per side, indexed
+- `src/book.rs`  -- the book itself: one dense level array per side, indexed
   directly by price tick.
-- `src/id_table.rs` — dense order-id index: id to pool slot in one array
+- `src/id_table.rs`  -- dense order-id index: id to pool slot in one array
   lookup, grown geometrically as larger ids arrive.
 
 ## How it works
