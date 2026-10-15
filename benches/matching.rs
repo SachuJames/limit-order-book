@@ -1,5 +1,6 @@
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use limit_order_book::{Fill, OrderBook, OrderType, Side};
+use std::time::{Duration, Instant};
 
 fn fill_buf() -> [Fill; 64] {
     [Fill {
@@ -22,26 +23,34 @@ fn seeded() -> OrderBook {
     book
 }
 
+/// Timed closure with `iter_batched` here included book setup in the
+/// measurement, which drowned the per-order numbers (OrderBook::new zeroes
+/// 48 MiB of level arrays). `iter_custom` keeps setup out of the clock.
 fn bench_insert(c: &mut Criterion) {
     c.bench_function("insert resting order", |b| {
-        b.iter_batched(
-            OrderBook::new,
-            |mut book| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut book = OrderBook::new();
+                let start = Instant::now();
                 for i in 0..10u64 {
                     black_box(book.insert(i, Side::Bid, 100_000, 10, 1)).unwrap();
                 }
-            },
-            BatchSize::SmallInput,
-        );
+                total += start.elapsed();
+            }
+            total
+        });
     });
 }
 
 fn bench_submit_sweep(c: &mut Criterion) {
     c.bench_function("submit sweeping 5 levels", |b| {
-        b.iter_batched(
-            seeded,
-            |mut book| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut book = seeded();
                 let mut fills = fill_buf();
+                let start = Instant::now();
                 // IOC so the taker never rests and the seeded book barely
                 // changes shape between iterations.
                 black_box(book.submit(
@@ -53,24 +62,28 @@ fn bench_submit_sweep(c: &mut Criterion) {
                     OrderType::Ioc,
                     &mut fills,
                 ))
-                .unwrap()
-            },
-            BatchSize::SmallInput,
-        );
+                .unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
     });
 }
 
 fn bench_cancel(c: &mut Criterion) {
     c.bench_function("cancel resting order", |b| {
-        b.iter_batched(
-            seeded,
-            |mut book| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut book = seeded();
+                let start = Instant::now();
                 for i in 0..10u64 {
                     black_box(book.cancel(i)).unwrap();
                 }
-            },
-            BatchSize::SmallInput,
-        );
+                total += start.elapsed();
+            }
+            total
+        });
     });
 }
 
