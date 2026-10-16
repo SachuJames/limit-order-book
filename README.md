@@ -5,12 +5,11 @@ priority, array-indexed price levels, pooled order nodes, and no allocations
 on the hot path. The design borrows from the OpenBook v2 slab layout, adapted
 into a standalone zero-alloc core.
 
-Finished Oct 15, 2026 after a 5-day build: the engine knows order types and
-a self-trade rule (limit orders rest, IOC fills what it can and drops the
-rest, FOK is all-or-nothing, and a trader can never cross their own resting
-orders, those get cancelled instead of printing a fill), and the benchmark
-numbers below are the real measured ones from the criterion harness in
-`benches/`.
+The engine supports limit, IOC and FOK orders with a self-trade rule:
+limit orders rest, IOC fills what it can and drops the rest, FOK is
+all-or-nothing, and a trader can never cross their own resting orders
+(those get cancelled instead of printing a fill). Benchmarks live in
+`benches/` and the measured numbers are below.
 
 ## Performance
 
@@ -84,8 +83,9 @@ cargo build
 cargo test
 ```
 
-## Next
+## Possible next steps
 
-Day 5 is done and this block is complete. The book supports limit, IOC and
-FOK orders with self-trade prevention, the 38 tests pass, and the measured
-latency is documented above. Next project is itch-feed, starting Oct 17.
+- Cancel/replace (modify) that keeps queue position on a pure size-down.
+- A post-only flag that rejects an order instead of letting it cross.
+- A small replay harness that feeds recorded order flow through the book
+  for regression checks.
